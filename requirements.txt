@@ -1,0 +1,5 @@
+pandas
+pyarrow
+s3fs
+boto3
+python-dateutil
