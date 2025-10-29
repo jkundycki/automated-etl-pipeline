@@ -29,4 +29,28 @@ jobs:
           WEATHER_BUCKET: automated-etl-pipeline
           WEATHER_LOCATIONS: '[{"name":"seattle","lat":47.6062,"lon":-122.3321},{"name":"newyork","lat":40.7128,"lon":-74.0060}]'
         run: python main.py
+      - name: Refresh partitions (hourly & daily)
+        run: |
+          OUT="s3://automated-etl-pipeline/athena-results/"
+          Q1="MSCK REPAIR TABLE automated_etl_db.weather_hourly;"
+          Q2="MSCK REPAIR TABLE automated_etl_db.weather_daily;"
+          aws athena start-query-execution --work-group primary \
+            --query-string "$Q1 $Q2" \
+            --result-configuration OutputLocation=$OUT
+      - name: Sanity check today's data
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          echo "Verifying rows for $TODAY..."
+          OUT="s3://automated-etl-pipeline/athena-results/"
+          SQL="SELECT COUNT(*) AS c FROM automated_etl_db.weather_hourly WHERE date = DATE '$TODAY';"
+          QID=$(aws athena start-query-execution \
+              --work-group primary \
+              --query-string "$SQL" \
+              --result-configuration OutputLocation=$OUT \
+              --query 'QueryExecutionId' --output text)
+          sleep 10
+          STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+              --query 'QueryExecution.Status.State' --output text)
+          echo "Athena query state: $STATE"
+
 
