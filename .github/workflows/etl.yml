@@ -1,3 +1,33 @@
+name: nightly-etl
+
+on:
+  schedule:
+    - cron: "15 4 * * *"     # 04:15 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::938116566456:role/github-actions-etl
+          aws-region: us-west-2
+
       - name: Run ETL
         env:
           WEATHER_BUCKET: automated-etl-pipeline
@@ -14,7 +44,6 @@
                   --query-string "$Q" \
                   --result-configuration OutputLocation="$OUT" \
                   --query 'QueryExecutionId' --output text)
-          # wait
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
                     --query 'QueryExecution.Status.State' --output text)
@@ -34,7 +63,6 @@
                   --query-string "$Q" \
                   --result-configuration OutputLocation="$OUT" \
                   --query 'QueryExecutionId' --output text)
-          # wait
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
                     --query 'QueryExecution.Status.State' --output text)
