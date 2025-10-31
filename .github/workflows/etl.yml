@@ -1,4 +1,40 @@
-      - name: MSCK hourly (with reason)
+name: nightly-etl
+
+on:
+  schedule:
+    - cron: "15 4 * * *"     # 04:15 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::938116566456:role/github-actions-etl
+          aws-region: us-west-2
+
+      - name: Run ETL
+        env:
+          WEATHER_BUCKET: automated-etl-pipeline
+          WEATHER_LOCATIONS: '[{"name":"seattle","lat":47.6062,"lon":-122.3321},{"name":"newyork","lat":40.7128,"lon":-74.0060}]'
+        run: python main.py
+
+      - name: MSCK hourly
         run: |
           set -euo pipefail
           OUT="s3://automated-etl-pipeline/athena-results/"
@@ -12,18 +48,17 @@
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
                      --query 'QueryExecution.Status.State' --output text)
-            echo "State: $STATE"
-            if [ "$STATE" = "SUCCEEDED" ]; then break; fi
+            echo "hourly state: $STATE"
+            [ "$STATE" = "SUCCEEDED" ] && break
             if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELLED" ]; then
-              REASON=$(aws athena get-query-execution --query-execution-id "$QID" \
-                       --query 'QueryExecution.Status.StateChangeReason' --output text)
-              echo "MSCK hourly failed: $REASON"
+              aws athena get-query-execution --query-execution-id "$QID" \
+                --query 'QueryExecution.Status.StateChangeReason' --output text
               exit 1
             fi
             sleep 2
           done
 
-      - name: MSCK daily (with reason)
+      - name: MSCK daily
         run: |
           set -euo pipefail
           OUT="s3://automated-etl-pipeline/athena-results/"
@@ -37,52 +72,38 @@
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
                      --query 'QueryExecution.Status.State' --output text)
-            echo "State: $STATE"
-            if [ "$STATE" = "SUCCEEDED" ]; then break; fi
+            echo "daily state: $STATE"
+            [ "$STATE" = "SUCCEEDED" ] && break
             if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELLED" ]; then
-              REASON=$(aws athena get-query-execution --query-execution-id "$QID" \
-                       --query 'QueryExecution.Status.StateChangeReason' --output text)
-              echo "MSCK daily failed: $REASON"
+              aws athena get-query-execution --query-execution-id "$QID" \
+                --query 'QueryExecution.Status.StateChangeReason' --output text
               exit 1
             fi
             sleep 2
           done
 
-      - name: Sanity check (today + yesterday, with S3 listing)
+      - name: Sanity check today's data
         run: |
           set -euo pipefail
           TODAY=$(date -u +%Y-%m-%d)
-          YDAY=$(date -u -d 'yesterday' +%Y-%m-%d)
-          echo "Checking counts for TODAY=$TODAY and YDAY=$YDAY"
-
+          echo "Verifying rows for $TODAY..."
           OUT="s3://automated-etl-pipeline/athena-results/"
-          for D in "$TODAY" "$YDAY"; do
-            SQL="SELECT COUNT(*) AS c FROM automated_etl_db.weather_hourly WHERE date = DATE '$D';"
-            echo "SQL: $SQL"
-            QID=$(aws athena start-query-execution --work-group primary \
-                   --query-string "$SQL" \
-                   --result-configuration OutputLocation="$OUT" \
-                   --query 'QueryExecutionId' --output text)
-            for i in {1..30}; do
-              STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
-                       --query 'QueryExecution.Status.State' --output text)
-              echo "Athena state for $D: $STATE"
-              [ "$STATE" = "SUCCEEDED" ] && break
-              [ "$STATE" = "FAILED" ] && echo "Count query failed for $D" && exit 1
-              sleep 2
-            done
-            COUNT=$(aws athena get-query-results --query-execution-id "$QID" \
-                     --query 'ResultSet.Rows[1].Data[0].VarCharValue' --output text)
-            echo "Rows for $D: $COUNT"
+          SQL="SELECT COUNT(*) AS c FROM automated_etl_db.weather_hourly WHERE date = DATE '$TODAY';"
+          QID=$(aws athena start-query-execution \
+                --work-group primary \
+                --query-string "$SQL" \
+                --result-configuration OutputLocation="$OUT" \
+                --query 'QueryExecutionId' --output text)
+          for i in {1..30}; do
+            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+                     --query 'QueryExecution.Status.State' --output text)
+            echo "sanity state: $STATE"
+            [ "$STATE" = "SUCCEEDED" ] && break
+            [ "$STATE" = "FAILED" ] && echo "Sanity query failed" && exit 1
+            sleep 2
           done
-
-          echo "Recent S3 objects under hourly/"
-          aws s3 ls s3://automated-etl-pipeline/weather/hourly/ --recursive | tail -n 20
-
-          # Fail only if BOTH today and yesterday are zero (UTC timing guard)
-          if [ "${COUNT_TODAY:-0}" = "" ]; then
-            COUNT_TODAY=$(aws athena start-query-execution --work-group primary \
-              --query-string "SELECT COUNT(*) FROM automated_etl_db.weather_hourly WHERE date = DATE '$TODAY';" \
-              --result-configuration OutputLocation="$OUT" --query 'QueryExecutionId' --output text >/dev/null 2>&1 || echo 0)
-          fi
+          COUNT=$(aws athena get-query-results --query-execution-id "$QID" \
+                  --query 'ResultSet.Rows[1].Data[0].VarCharValue' --output text)
+          echo "Rows today: $COUNT"
+          [ "$COUNT" -gt 0 ] || { echo "No rows for today — failing"; exit 1; }
 
