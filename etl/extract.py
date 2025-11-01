@@ -1,72 +1,52 @@
-import os
-import json
-import requests
+# etl/extract.py
+import os, json, requests, pandas as pd
 from datetime import date
-import pandas as pd
 
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 
-def _locations_from_env():
-    raw = os.getenv("WEATHER_LOCATIONS", '[{"name":"seattle","lat":47.6062,"lon":-122.3321}]')
-    return json.loads(raw)
+# Parse locations from ENV (GitHub Actions already sets WEATHER_LOCATIONS)
+def _load_locations():
+    raw = os.getenv("WEATHER_LOCATIONS",
+        '[{"name":"seattle","lat":47.6062,"lon":-122.3321},{"name":"newyork","lat":40.7128,"lon":-74.0060}]'
+    )
+    locs = json.loads(raw)
+    # normalize
+    out = []
+    for l in locs:
+        out.append({
+            "name": str(l["name"]).strip().lower(),
+            "lat": float(l["lat"]),
+            "lon": float(l["lon"]),
+        })
+    return out
 
-def fetch_weather_for_location(loc, target_date=None):
-    """Return two DataFrames: hourly_df, daily_df for a single location."""
-    target_date = target_date or date.today().isoformat()
-    params = {
-        "latitude": loc["lat"],
-        "longitude": loc["lon"],
-        "timezone": "auto",
-        "start_date": target_date,
-        "end_date": target_date,
-        "hourly": ",".join([
-            "temperature_2m",
-            "relative_humidity_2m",
-            "dew_point_2m",
-            "apparent_temperature",
-            "precipitation",
-            "rain",
-            "snowfall",
-            "cloud_cover",
-            "windspeed_10m",
-            "winddirection_10m"
-        ]),
-        "daily": ",".join([
-            "temperature_2m_max",
-            "temperature_2m_min",
-            "precipitation_sum",
-            "windspeed_10m_max",
-        ]),
-    }
-    r = requests.get(OPEN_METEO_URL, params=params, timeout=30)
+def _fetch_open_meteo(lat: float, lon: float, day: date | None = None) -> pd.DataFrame:
+    hourly = ",".join([
+        "temperature_2m","relative_humidity_2m","apparent_temperature",
+        "precipitation","cloud_cover","windspeed_10m","winddirection_10m"
+    ])
+    params = {"latitude": lat, "longitude": lon, "hourly": hourly, "timezone": "UTC"}
+    if day:
+        ds = day.strftime("%Y-%m-%d")
+        params["start_date"] = ds
+        params["end_date"]   = ds
+
+    r = requests.get(OPEN_METEO, params=params, timeout=30)
     r.raise_for_status()
-    js = r.json()
+    h = r.json()["hourly"]
+    df = pd.DataFrame(h)
+    df.rename(columns={"time": "timestamp"}, inplace=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df["date"]  = df["timestamp"].dt.date
+    df["year"]  = df["timestamp"].dt.year
+    df["month"] = df["timestamp"].dt.month
+    df["day"]   = df["timestamp"].dt.day
+    return df
 
-    # Hourly
-    h = js.get("hourly", {})
-    hourly_df = pd.DataFrame(h)
-    if not hourly_df.empty:
-        hourly_df["time"] = pd.to_datetime(hourly_df["time"])
-        hourly_df["location"] = loc["name"]
-
-    # Daily
-    d = js.get("daily", {})
-    daily_df = pd.DataFrame(d)
-    if not daily_df.empty:
-        daily_df["time"] = pd.to_datetime(daily_df["time"])
-        daily_df["location"] = loc["name"]
-
-    return hourly_df, daily_df
-
-def extract_all(target_date=None):
-    """Fetch all locations; return concatenated hourly_df, daily_df."""
-    hourly_all, daily_all = [], []
-    for loc in _locations_from_env():
-        h, d = fetch_weather_for_location(loc, target_date)
-        if not h.empty:
-            hourly_all.append(h)
-        if not d.empty:
-            daily_all.append(d)
-    hourly = pd.concat(hourly_all, ignore_index=True) if hourly_all else pd.DataFrame()
-    daily  = pd.concat(daily_all,  ignore_index=True) if daily_all  else pd.DataFrame()
-    return hourly, daily
+def extract_all(day: date | None = None) -> pd.DataFrame:
+    frames = []
+    for loc in _load_locations():
+        df = _fetch_open_meteo(loc["lat"], loc["lon"], day=day)
+        df["location"] = loc["name"]   # <-- crucial: stamp the city
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True)
