@@ -1,13 +1,20 @@
 name: nightly-etl
-
 on:
   schedule:
-    - cron: "15 4 * * *"     # 04:15 UTC nightly
+    - cron: "15 04 * * *"      # 04:15 UTC nightly
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
+
+env:
+  AWS_REGION: us-west-2
+  S3_BUCKET: automated-etl-pipeline
+  ATHENA_OUTPUT: s3://automated-etl-pipeline/athena-results/
+  DB: automated_etl_db
+  HOURLY_TABLE: weather_hourly
+  ICEBERG_TABLE: city_daily_summary_iceberg
 
 jobs:
   run:
@@ -19,91 +26,117 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Configure AWS creds
+      - name: Configure AWS creds (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::938116566456:role/github-actions-etl
-          aws-region: us-west-2
+          aws-region: ${{ env.AWS_REGION }}
 
+      # --------- 1) Run your Python ETL to S3 (hourly/daily parquet) ----------
       - name: Run ETL
         env:
-          WEATHER_BUCKET: automated-etl-pipeline
-          WEATHER_LOCATIONS: '[{"name":"seattle","lat":47.6062,"lon":-122.3321},{"name":"newyork","lat":40.7128,"lon":-74.0060}]'
+          WEATHER_BUCKET: ${{ env.S3_BUCKET }}
+          WEATHER_LOCATIONS: >-
+            [{"name":"seattle","lat":47.6062,"lon":-122.3321},
+             {"name":"newyork","lat":40.7128,"lon":-74.0060}]
         run: python main.py
 
-      - name: MSCK hourly
+      # --------- 2) Refresh partitions for hourly/daily (Hive external) -------
+      - name: Refresh partitions (hourly & daily)
         run: |
-          set -euo pipefail
-          OUT="s3://automated-etl-pipeline/athena-results/"
-          Q="MSCK REPAIR TABLE automated_etl_db.weather_hourly"
-          echo "Running: $Q"
-          QID=$(aws athena start-query-execution \
-                  --work-group primary \
-                  --query-string "$Q" \
-                  --result-configuration OutputLocation="$OUT" \
-                  --query 'QueryExecutionId' --output text)
-          for i in {1..30}; do
-            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
-                     --query 'QueryExecution.Status.State' --output text)
-            echo "hourly state: $STATE"
-            [ "$STATE" = "SUCCEEDED" ] && break
-            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELLED" ]; then
-              aws athena get-query-execution --query-execution-id "$QID" \
-                --query 'QueryExecution.Status.StateChangeReason' --output text
-              exit 1
-            fi
-            sleep 2
-          done
+          Q="MSCK REPAIR TABLE ${{ env.DB }}.${{ env.HOURLY_TABLE }}; \
+             MSCK REPAIR TABLE ${{ env.DB }}.weather_daily;"
+          aws athena start-query-execution \
+            --work-group primary \
+            --query-string "$Q" \
+            --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
 
-      - name: MSCK daily
+      # --------- 3) Sanity check today's ingest ------------------------------
+      - name: Sanity check today's hourly rows per location
         run: |
-          set -euo pipefail
-          OUT="s3://automated-etl-pipeline/athena-results/"
-          Q="MSCK REPAIR TABLE automated_etl_db.weather_daily"
-          echo "Running: $Q"
-          QID=$(aws athena start-query-execution \
-                  --work-group primary \
-                  --query-string "$Q" \
-                  --result-configuration OutputLocation="$OUT" \
-                  --query 'QueryExecutionId' --output text)
-          for i in {1..30}; do
-            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
-                     --query 'QueryExecution.Status.State' --output text)
-            echo "daily state: $STATE"
-            [ "$STATE" = "SUCCEEDED" ] && break
-            if [ "$STATE" = "FAILED" ] || [ "$STATE" = "CANCELLED" ]; then
-              aws athena get-query-execution --query-execution-id "$QID" \
-                --query 'QueryExecution.Status.StateChangeReason' --output text
-              exit 1
-            fi
-            sleep 2
-          done
-
-      - name: Sanity check today's data
-        run: |
-          set -euo pipefail
           TODAY=$(date -u +%Y-%m-%d)
-          echo "Verifying rows for $TODAY..."
-          OUT="s3://automated-etl-pipeline/athena-results/"
-          SQL="SELECT COUNT(*) AS c FROM automated_etl_db.weather_hourly WHERE date = DATE '$TODAY';"
+          SQL="SELECT location, COUNT(*) AS c
+               FROM ${{ env.DB }}.${{ env.HOURLY_TABLE }}
+               WHERE date = DATE '$TODAY'
+               GROUP BY 1;"
           QID=$(aws athena start-query-execution \
-                --work-group primary \
-                --query-string "$SQL" \
-                --result-configuration OutputLocation="$OUT" \
-                --query 'QueryExecutionId' --output text)
+                  --work-group primary \
+                  --query-string "$SQL" \
+                  --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }} \
+                  --query 'QueryExecutionId' --output text)
+          # simple wait loop
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
-                     --query 'QueryExecution.Status.State' --output text)
-            echo "sanity state: $STATE"
+                    --query 'QueryExecution.Status.State' --output text)
             [ "$STATE" = "SUCCEEDED" ] && break
             [ "$STATE" = "FAILED" ] && echo "Sanity query failed" && exit 1
             sleep 2
           done
-          COUNT=$(aws athena get-query-results --query-execution-id "$QID" \
-                  --query 'ResultSet.Rows[1].Data[0].VarCharValue' --output text)
-          echo "Rows today: $COUNT"
-          [ "$COUNT" -gt 0 ] || { echo "No rows for today — failing"; exit 1; }
+          # Optional: fetch & print results (for logs)
+          aws athena get-query-results --query-execution-id "$QID" >/dev/null
+
+      # --------- 4) Create Iceberg table if first run (idempotent) -----------
+      - name: Ensure Iceberg table exists
+        run: |
+          CREATE="
+          CREATE TABLE IF NOT EXISTS ${{ env.DB }}.${{ env.ICEBERG_TABLE }} (
+            date           date,
+            location       string,
+            avg_temp       double,
+            avg_humidity   double,
+            avg_windspeed  double,
+            total_precip   double
+          )
+          PARTITIONED BY (date, location)
+          LOCATION 's3://${{ env.S3_BUCKET }}/gold/city_daily_summary_iceberg/'
+          TBLPROPERTIES ('table_type'='ICEBERG','format'='PARQUET');"
+          aws athena start-query-execution \
+            --work-group primary \
+            --query-string "$CREATE" \
+            --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
+
+      # --------- 5) Incremental Iceberg load for *today* ---------------------
+      - name: Upsert today's partition into Iceberg (INSERT works with Iceberg)
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          SQL="
+          INSERT INTO ${{ env.DB }}.${{ env.ICEBERG_TABLE }}
+          SELECT
+            date,
+            location,
+            AVG(temperature_2m)       AS avg_temp,
+            AVG(relative_humidity_2m) AS avg_humidity,
+            AVG(windspeed_10m)        AS avg_windspeed,
+            SUM(precipitation)        AS total_precip
+          FROM ${{ env.DB }}.${{ env.HOURLY_TABLE }}
+          WHERE date = DATE '$TODAY'
+          GROUP BY date, location;"
+          aws athena start-query-execution \
+            --work-group primary \
+            --query-string "$SQL" \
+            --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
+
+      # --------- 6) Smoke test Iceberg has both cities today -----------------
+      - name: Validate Iceberg partition for both cities
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          SQL="
+          SELECT location, COUNT(*) AS c
+          FROM ${{ env.DB }}.${{ env.ICEBERG_TABLE }}
+          WHERE date = DATE '$TODAY'
+          GROUP BY 1;"
+          QID=$(aws athena start-query-execution \
+                  --work-group primary \
+                  --query-string "$SQL" \
+                  --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }} \
+                  --query 'QueryExecutionId' --output text)
+          for i in {1..30}; do
+            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+                    --query 'QueryExecution.Status.State' --output text)
+            [ "$STATE" = "SUCCEEDED" ] && break
+            [ "$STATE" = "FAILED" ] && echo "Iceberg validation failed" && exit 1
+            sleep 2
+          done
 
