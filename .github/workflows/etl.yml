@@ -1,7 +1,7 @@
 name: nightly-etl
 on:
   schedule:
-    - cron: "15 04 * * *"      # 04:15 UTC nightly
+    - cron: "15 04 * * *"   # runs at 04:15 UTC nightly
   workflow_dispatch:
 
 permissions:
@@ -34,7 +34,7 @@ jobs:
           role-to-assume: arn:aws:iam::938116566456:role/github-actions-etl
           aws-region: ${{ env.AWS_REGION }}
 
-      # --------- 1) Run your Python ETL to S3 (hourly/daily parquet) ----------
+      # --------- 1) Run Python ETL (extract, transform, load) ----------
       - name: Run ETL
         env:
           WEATHER_BUCKET: ${{ env.S3_BUCKET }}
@@ -43,17 +43,43 @@ jobs:
              {"name":"newyork","lat":40.7128,"lon":-74.0060}]
         run: python main.py
 
-      # --------- 2) Refresh partitions for hourly/daily (Hive external) -------
-      - name: Refresh partitions (hourly & daily)
+      # --------- 2) Refresh partitions for hourly ----------
+      - name: MSCK hourly
         run: |
-          Q="MSCK REPAIR TABLE ${{ env.DB }}.${{ env.HOURLY_TABLE }}; \
-             MSCK REPAIR TABLE ${{ env.DB }}.weather_daily;"
-          aws athena start-query-execution \
-            --work-group primary \
-            --query-string "$Q" \
-            --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
+          set -euo pipefail
+          Q="MSCK REPAIR TABLE ${{ env.DB }}.${{ env.HOURLY_TABLE }}"
+          QID=$(aws athena start-query-execution \
+                  --work-group primary \
+                  --query-string "$Q" \
+                  --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }} \
+                  --query 'QueryExecutionId' --output text)
+          for i in {1..60}; do
+            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+                    --query 'QueryExecution.Status.State' --output text)
+            [ "$STATE" = "SUCCEEDED" ] && break
+            [ "$STATE" = "FAILED" ] && echo "MSCK hourly failed" && exit 1
+            sleep 2
+          done
 
-      # --------- 3) Sanity check today's ingest ------------------------------
+      # --------- 3) Refresh partitions for daily ----------
+      - name: MSCK daily
+        run: |
+          set -euo pipefail
+          Q="MSCK REPAIR TABLE ${{ env.DB }}.weather_daily"
+          QID=$(aws athena start-query-execution \
+                  --work-group primary \
+                  --query-string "$Q" \
+                  --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }} \
+                  --query 'QueryExecutionId' --output text)
+          for i in {1..60}; do
+            STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
+                    --query 'QueryExecution.Status.State' --output text)
+            [ "$STATE" = "SUCCEEDED" ] && break
+            [ "$STATE" = "FAILED" ] && echo "MSCK daily failed" && exit 1
+            sleep 2
+          done
+
+      # --------- 4) Sanity check that today's rows exist ----------
       - name: Sanity check today's hourly rows per location
         run: |
           TODAY=$(date -u +%Y-%m-%d)
@@ -66,7 +92,6 @@ jobs:
                   --query-string "$SQL" \
                   --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }} \
                   --query 'QueryExecutionId' --output text)
-          # simple wait loop
           for i in {1..30}; do
             STATE=$(aws athena get-query-execution --query-execution-id "$QID" \
                     --query 'QueryExecution.Status.State' --output text)
@@ -74,10 +99,8 @@ jobs:
             [ "$STATE" = "FAILED" ] && echo "Sanity query failed" && exit 1
             sleep 2
           done
-          # Optional: fetch & print results (for logs)
-          aws athena get-query-results --query-execution-id "$QID" >/dev/null
 
-      # --------- 4) Create Iceberg table if first run (idempotent) -----------
+      # --------- 5) Ensure Iceberg table exists ----------
       - name: Ensure Iceberg table exists
         run: |
           CREATE="
@@ -97,8 +120,8 @@ jobs:
             --query-string "$CREATE" \
             --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
 
-      # --------- 5) Incremental Iceberg load for *today* ---------------------
-      - name: Upsert today's partition into Iceberg (INSERT works with Iceberg)
+      # --------- 6) Insert today's aggregated data into Iceberg ----------
+      - name: Upsert today's partition into Iceberg
         run: |
           TODAY=$(date -u +%Y-%m-%d)
           SQL="
@@ -118,7 +141,7 @@ jobs:
             --query-string "$SQL" \
             --result-configuration OutputLocation=${{ env.ATHENA_OUTPUT }}
 
-      # --------- 6) Smoke test Iceberg has both cities today -----------------
+      # --------- 7) Verify Iceberg updated for both cities ----------
       - name: Validate Iceberg partition for both cities
         run: |
           TODAY=$(date -u +%Y-%m-%d)
